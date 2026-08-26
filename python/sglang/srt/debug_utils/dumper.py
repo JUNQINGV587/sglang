@@ -1735,7 +1735,7 @@ class _SGLangPlugin(_FrameworkPlugin):
             info["moe_tp_rank"] = parallel.moe_tp_rank
             info["moe_tp_size"] = parallel.moe_tp_size
             info["moe_dp_rank"] = parallel.moe_dp_rank
-            info["moe_dp_size"] = parallel.moe_dp_size
+            info["moe_dp_size"] = self._dp_attn.get_moe_cp_size()
         except (AttributeError, AssertionError):
             info["distributed_error"] = True
 
