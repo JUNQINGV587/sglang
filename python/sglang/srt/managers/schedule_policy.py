@@ -632,6 +632,10 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        # Every request admitted as a *new* chunk this pass, not just the last
+        # one. The scheduler turns all of them into in-flight chunked requests
+        # so several prompts can share one extend forward.
+        self.new_chunked_reqs: List[Req] = []
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_device_hit_tokens = 0
@@ -1196,6 +1200,35 @@ class PrefillAdder:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
+    def chunk_slice_share(self) -> int:
+        """Chunk length a new chunked request gets in this pass.
+
+        With ``--prefill-max-requests N > 1`` the remaining chunk budget is
+        split evenly across the passes' still-admissible slots instead of the
+        first request taking all of it. That is what lets several prompts
+        advance in the same extend forward: without it the first request
+        consumes ``rem_chunk_tokens`` and every later candidate is rejected by
+        ``budget_state()`` (OTHER), so prefill stays strictly serial.
+        """
+        rem = self.rem_chunk_tokens
+        if rem is None or self.prefill_max_requests is None:
+            return rem
+        if self.prefill_max_requests <= 1:
+            return rem
+        admitted = len(self.can_run_list)
+        slots = self.prefill_max_requests - admitted
+        # Requests still queued behind the ones admitted in this pass.
+        pending = self.waiting_queue_len - admitted
+        slots = min(slots, max(1, pending))
+        if slots <= 1:
+            return rem
+        share = rem // slots
+        # Keep the slice page aligned so prepare_for_extend does not round it
+        # back up over the budget, and never slice below one page.
+        page = self.page_size or 1
+        share = (share // page) * page
+        return share if share >= page else rem
+
     def add_one_req_ignore_eos(self, req: Req):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         paged_input = (
@@ -1311,8 +1344,9 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
-            # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            # Chunked prefill. Share the remaining chunk budget with the
+            # other requests this pass may still admit (see chunk_slice_share).
+            trunc_len = self.chunk_slice_share()
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1325,6 +1359,7 @@ class PrefillAdder:
             req.extend_end = req.prefix_len + trunc_len
             self.can_run_list.append(req)
             self.new_chunked_req = req
+            self.new_chunked_reqs.append(req)
             self._update_prefill_budget(
                 0,
                 trunc_len,

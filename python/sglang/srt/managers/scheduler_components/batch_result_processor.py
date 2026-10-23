@@ -263,7 +263,7 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        skip_stream_req = None
+        skip_stream_reqs: List[Req] = []
         self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
@@ -435,10 +435,9 @@ class SchedulerBatchResultProcessor:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.inflight_middle_chunks -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
+                    # This request does not finish prefill, so don't stream it.
+                    # Several chunks can share one forward, hence the list.
+                    skip_stream_reqs.append(req)
 
                     # Incrementally update input logprobs.
                     if batch.return_logprob:
@@ -509,7 +508,7 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_end()
         self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
+            batch.reqs, batch.return_logprob, skip_stream_reqs or None
         )
 
         can_run_cuda_graph = result.can_run_cuda_graph

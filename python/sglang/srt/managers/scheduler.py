@@ -1364,6 +1364,10 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        # All in-flight chunked-prefill requests. ``chunked_req`` is kept as the
+        # primary (= chunked_reqs[0]) so the many single-request call sites keep
+        # working unchanged; with zero or one chunk the two are identical.
+        self.chunked_reqs: List[Req] = []
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -3722,6 +3726,11 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
+    def _set_inflight_chunks(self, reqs) -> None:
+        """Keep ``chunked_reqs`` and the legacy ``chunked_req`` in sync."""
+        self.chunked_reqs = [r for r in reqs if r is not None]
+        self.chunked_req = self.chunked_reqs[0] if self.chunked_reqs else None
+
     def stash_chunked_request(self, req: Req):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.checkpoint_disagg_prefill(req)
@@ -3745,7 +3754,7 @@ class Scheduler(
         req = self._pending_chunked_abort_req
         if req is None:
             return
-        if self.chunked_req is not req:
+        if req not in self.chunked_reqs:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
             if req.finished() or not req.kv.holds_kv:
@@ -3771,7 +3780,7 @@ class Scheduler(
         self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
 
-        self.chunked_req = None
+        self._set_inflight_chunks([r for r in self.chunked_reqs if r is not req])
         self._pending_chunked_abort_req = None
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
@@ -3861,15 +3870,16 @@ class Scheduler(
             for req in self.dllm_manager.staging_queue:
                 self.finish_dllm_forward(req)
 
-        if self.chunked_req is not None:
-            # Move the chunked request out of the batch so that we can merge
+        for chunked_req in self.chunked_reqs:
+            # Move the chunked requests out of the batch so that we can merge
             # only finished requests to running_batch.
-            reqs_to_exclude.add(self.chunked_req)
+            reqs_to_exclude.add(chunked_req)
 
             # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
             # extend_end at prefix_len: it computed no new KV, so nothing to stash.
-            if self.chunked_req.extend_end > self.chunked_req.prefix_len:
-                self.stash_chunked_request(self.chunked_req)
+            # This is also what advances req.prefix_len to req.extend_end.
+            if chunked_req.extend_end > chunked_req.prefix_len:
+                self.stash_chunked_request(chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
@@ -4126,15 +4136,43 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
-                self.chunked_req,
-                self.waiting_queue,
-                adder.rem_chunk_tokens or 0,
-                self.page_size,
+        if self.chunked_reqs:
+            continued = []
+            # Fair share: split the chunk budget across the in-flight chunks so
+            # that every one of them advances in this forward. Otherwise
+            # ``add_chunked_req`` hands the whole remaining budget to the first
+            # chunk and parks the rest, which is exactly the serialization we
+            # are trying to remove.
+            n_cont = len(self.chunked_reqs)
+            want_new = (
+                max(0, (get_schedule().prefill_max_requests or 1) - n_cont)
+                if self.waiting_queue
+                else 0
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            shares = max(1, n_cont + want_new)
+            rem = adder.rem_chunk_tokens or 0
+            fair = None
+            if shares > 1 and rem > 0:
+                page = self.page_size or 1
+                fair = (rem // shares) // page * page
+                if fair < page:
+                    fair = None
+            for chunked_req in self.chunked_reqs:
+                chunked_req.init_next_round_input()
+                limit = self.policy.shortest_prefill_chunk_limit(
+                    chunked_req,
+                    self.waiting_queue,
+                    adder.rem_chunk_tokens or 0,
+                    self.page_size,
+                )
+                if fair is not None:
+                    limit = fair if limit is None else min(limit, fair)
+                adder.chunked_req_limit = limit
+                # None means this request's prompt is complete.
+                cont = adder.add_chunked_req(chunked_req)
+                if cont is not None:
+                    continued.append(cont)
+            self._set_inflight_chunks(continued)
 
         if self.enable_lora:
             running_loras = {
@@ -4222,7 +4260,7 @@ class Scheduler(
                     continue
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(self.chunked_req is not None),
+                has_chunked_req=bool(self.chunked_reqs),
                 truncation_align_size=self.truncation_align_size,
             )
 
@@ -4274,13 +4312,15 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if adder.new_chunked_req is not None:
-            # Update chunked prefill
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
+        if adder.new_chunked_reqs:
+            # Update chunked prefill: a continuing chunk and freshly admitted
+            # chunks can now share one forward.
+            self._set_inflight_chunks([*self.chunked_reqs, *adder.new_chunked_reqs])
+        elif not self.chunked_reqs:
+            self._set_inflight_chunks([])
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
+        for chunked_req in self.chunked_reqs:
+            chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -4296,8 +4336,8 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
 
-        new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+        new_batch.contains_last_prefill_chunk = self.chunked_req is None or any(
+            r.extend_end >= len(r.full_untruncated_fill_ids) for r in can_run_list
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
@@ -4319,9 +4359,7 @@ class Scheduler(
             running_batch.reqs,
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
-                chunk_deduct=(
-                    self.chunked_req.extend_len if self.chunked_req is not None else 0
-                ),
+                chunk_deduct=sum(r.extend_len for r in self.chunked_reqs),
             ),
         )
 
@@ -5537,7 +5575,7 @@ class Scheduler(
         live_reqs = {
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
-            *([self.chunked_req] if self.chunked_req is not None else []),
+            *self.chunked_reqs,
         }
         if self.hisparse_coordinator is not None:
             live_reqs.update(
@@ -5567,9 +5605,19 @@ class Scheduler(
         return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
-        if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
-                self._pending_chunked_abort_req = chunked_req
+        if chunked_reqs := self.chunked_reqs:
+            match = [
+                r
+                for r in chunked_reqs
+                if recv_req.abort_all or r.rid.startswith(recv_req.rid)
+            ]
+            if match:
+                # Promote the target to primary so the single-slot deferred-abort
+                # machinery handles it; the other chunks keep prefilling.
+                self._set_inflight_chunks(
+                    match + [r for r in chunked_reqs if r not in match]
+                )
+                self._pending_chunked_abort_req = self.chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
@@ -5753,13 +5801,12 @@ class Scheduler(
         ):
             retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
 
-        if (
-            self.chunked_req is not None
-            and not self.chunked_req.finished()
-            and self.chunked_req not in retract_reqs
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            retract_reqs.append(self.chunked_req)
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            retract_reqs += [
+                r
+                for r in self.chunked_reqs
+                if not r.finished() and r not in retract_reqs
+            ]
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
@@ -5809,7 +5856,9 @@ class Scheduler(
         # buffer + reset pending_bootstrap) before freeing KV, then retract for real.
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
-            self.chunked_req = None
+            # Every chunk was re-queued above; drop them all so the next pass
+            # cannot admit the same request twice.
+            self._set_inflight_chunks([])
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,

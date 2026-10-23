@@ -9,6 +9,7 @@ from typing import (
     ClassVar,
     List,
     Optional,
+    Union,
 )
 
 import torch
@@ -146,20 +147,29 @@ class SchedulerOutputStreamer:
         self,
         reqs: List[Req],
         return_logprob: bool,
-        skip_req: Optional[Req] = None,
+        skip_req: Optional[Union[Req, List[Req]]] = None,
         is_idle_batch: bool = False,
     ):
+        # Several in-flight chunked prefills can share one forward now, so the
+        # skipped set is normalized to a set here.
+        skip_reqs = (
+            frozenset()
+            if skip_req is None
+            else frozenset(skip_req)
+            if isinstance(skip_req, (list, tuple, set, frozenset))
+            else frozenset((skip_req,))
+        )
         return_hidden_states = any(
-            req.return_hidden_states for req in reqs if req is not skip_req
+            req.return_hidden_states for req in reqs if req not in skip_reqs
         )
         return_routed_experts = any(
-            req.return_routed_experts for req in reqs if req is not skip_req
+            req.return_routed_experts for req in reqs if req not in skip_reqs
         )
         return_indexer_topk = any(
-            req.return_indexer_topk for req in reqs if req is not skip_req
+            req.return_indexer_topk for req in reqs if req not in skip_reqs
         )
         return_sampling_mask = any(
-            req.return_sampling_mask for req in reqs if req is not skip_req
+            req.return_sampling_mask for req in reqs if req not in skip_reqs
         )
 
         acc = _GenerationStreamAccumulator(
@@ -180,7 +190,7 @@ class SchedulerOutputStreamer:
             current_weight_version=get_serving().weight_version,
         )
         for req in reqs:
-            if req is skip_req:
+            if req in skip_reqs:
                 continue
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
