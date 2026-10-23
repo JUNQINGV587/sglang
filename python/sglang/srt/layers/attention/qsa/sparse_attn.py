@@ -407,6 +407,137 @@ def pack_qsa_prefill_kv(
     return packed_k, packed_v
 
 
+@triton.jit(do_not_specialize=["MAX_ROWS", "BS"])
+def _pack_qsa_prefill_kv_range(
+    k,
+    v,
+    packed_k,
+    packed_v,
+    req_to_token,
+    req_indices,
+    req_base,
+    req_start,
+    req_rows,
+    SK0: tl.constexpr,
+    SK1: tl.constexpr,
+    SK2: tl.constexpr,
+    SV0: tl.constexpr,
+    SV1: tl.constexpr,
+    SV2: tl.constexpr,
+    SR0: tl.constexpr,
+    SR1: tl.constexpr,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+    MAX_ROWS,
+    BS,
+    HK,
+    HV,
+    RW,
+    HOST: tl.constexpr,
+):
+    """Append-only variant of ``_pack_qsa_prefill_kv``.
+
+    Every request owns a fixed region ``[req_base[b], req_base[b] + cap)`` of the
+    packed buffers, so a chunk that only grows the prefix by ``n`` rows writes
+    exactly those ``n`` rows at ``req_base[b] + req_start[b] + t`` instead of
+    re-gathering the whole prefix.  ``req_start[b]`` is the request's first
+    logical row for this call (0 when its region is filled from scratch).
+
+    The gather body is the same mapping as the full-pack kernel: logical row ->
+    ``req_to_token[req, row]`` slot -> device row or pinned host row.  Only the
+    destination offset and the row range differ, so a call that writes rows
+    ``[0, seq_len)`` produces bit-identical bytes to ``pack_qsa_prefill_kv``.
+    """
+    batch = tl.program_id(1)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    token = offsets // (HEADS * DIM)
+    rows = tl.load(req_rows + batch)
+    valid = token < rows
+    start = tl.load(req_start + batch).to(tl.int64)
+    base = tl.load(req_base + batch).to(tl.int64)
+    req = tl.load(req_indices + batch).to(tl.int64)
+    head = offsets // DIM % HEADS
+    dim = offsets % DIM
+    slot = tl.load(
+        req_to_token + req * SR0 + (start + token) * SR1, valid, 0
+    ).to(tl.int64)
+    dst = (base + start) * HEADS * DIM + offsets
+    if HOST:
+        dslot = tl.where((slot > 0) & (slot < RW), slot, -1)
+        dev = valid & (dslot > 0)
+        hos = valid & (dslot <= 0)
+        ko = head * SK1 + dim * SK2
+        keys = tl.where(
+            dev,
+            tl.load(k + dslot * SK0 + ko, dev, 0.0),
+            tl.load(HK + slot * SK0 + ko, hos, 0.0),
+        )
+        values = tl.where(
+            dev,
+            tl.load(v + dslot * SV0 + ko, dev, 0.0),
+            tl.load(HV + slot * SV0 + ko, hos, 0.0),
+        )
+    else:
+        keys = tl.load(k + slot * SK0 + head * SK1 + dim * SK2, valid, 0.0)
+        values = tl.load(v + slot * SV0 + head * SV1 + dim * SV2, valid, 0.0)
+    tl.store(packed_k + dst, keys, valid)
+    tl.store(packed_v + dst, values, valid)
+
+
+def pack_qsa_prefill_kv_range(
+    *,
+    k,
+    v,
+    packed_k,
+    packed_v,
+    req_to_token,
+    req_indices,
+    req_base,
+    req_start,
+    req_rows,
+    max_rows,
+    host_k=None,
+    host_v=None,
+    resident_tokens=0,
+):
+    """Gather ``req_rows[b]`` logical rows per request into its resident region.
+
+    ``packed_k``/``packed_v`` are caller-owned buffers with one fixed region per
+    request (``req_base`` is that region's first row); ``req_start`` is the first
+    logical row to write, which is what turns a chunked append into O(rows)
+    instead of O(prefix).
+    """
+    heads, dim = k.shape[1:]
+    batch_size = req_indices.numel()
+    if batch_size == 0 or max_rows <= 0:
+        return
+    grid = (triton.cdiv(max_rows * heads * dim, 1024), batch_size)
+    _pack_qsa_prefill_kv_range[grid](
+        k,
+        v,
+        packed_k,
+        packed_v,
+        req_to_token,
+        req_indices,
+        req_base,
+        req_start,
+        req_rows,
+        *k.stride(),
+        *v.stride(),
+        *req_to_token.stride(),
+        HEADS=heads,
+        DIM=dim,
+        BLOCK=1024,
+        MAX_ROWS=max_rows,
+        BS=batch_size,
+        HK=host_k if host_k is not None else k,
+        HV=host_v if host_v is not None else v,
+        RW=resident_tokens,
+        HOST=host_k is not None,
+    )
+
+
 def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape

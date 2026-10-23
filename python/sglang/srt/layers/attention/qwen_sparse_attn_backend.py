@@ -6,8 +6,11 @@ linear-attention layers continue to use GDN.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import math
+import os
+import sys
 from copy import copy
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
@@ -35,6 +38,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     pack_qsa_prefill_kv,
+    pack_qsa_prefill_kv_range,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
@@ -198,6 +202,338 @@ class QSAMTPSharedSparseIndices:
         return out
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+class QsaPackTiming:
+    """CUDA-event accounting for the chunk-prefill pack and sparse kernel.
+
+    Gated by ``SGLANG_QSA_PACK_TIMING=1``; off by default so the production path
+    keeps its old kernel sequence.  Prints a cumulative line every 1024 marks;
+    the accounting sync is amortised over ~40 forwards at 12 full-attn layers.
+    """
+
+    def __init__(self) -> None:
+        self.on = _env_float("SGLANG_QSA_PACK_TIMING", 0.0) != 0.0
+        self.pending = []
+        self.pack_s = 0.0
+        self.attn_s = 0.0
+        self.calls = 0
+        self.rows = 0
+
+    def start(self):
+        if not self.on:
+            return None
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        return ev
+
+    def stop(self, which: str, ev0, rows: int = 0) -> None:
+        if ev0 is None:
+            return
+        ev1 = torch.cuda.Event(enable_timing=True)
+        ev1.record()
+        self.pending.append((which, ev0, ev1))
+        if which == "pack":
+            self.calls += 1
+            self.rows += rows
+        if len(self.pending) >= 256:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.pending:
+            return
+        torch.cuda.synchronize()
+        for which, a, b in self.pending:
+            dt = a.elapsed_time(b) / 1e3
+            if which == "pack":
+                self.pack_s += dt
+            else:
+                self.attn_s += dt
+        self.pending.clear()
+        print(
+            f"[PKT] calls={self.calls} rows={self.rows} "
+            f"pack={self.pack_s:.2f}s attn={self.attn_s:.2f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+class QsaPackArena:
+    """Resident packed K/V regions so a chunked prefill packs each row once.
+
+    ``pack_qsa_prefill_kv`` re-gathers the **whole prefix** on every chunk, i.e.
+    O(N^2/c) gathered rows (and, with the host tier, O(N^2/c) PCIe reads) per
+    request.  This keeps one packed region per request alive for the duration of
+    its prefill, so a chunk gathers only its own ``c`` rows.  ``cu_k`` is just
+    each request's base row in the packed buffer, so a fixed per-request stride
+    is a valid ``cu_k``: same attention kernel, same bytes, fewer gathered rows.
+
+    Cost is ``slots * cap * 2 (K,V) * heads * dim * elt * n_layers`` device
+    memory, which is why it is off by default (``SGLANG_QSA_PACK_CACHE_MB=0``).
+
+    Knobs:
+      SGLANG_QSA_PACK_CACHE_MB    device budget (MiB), 0 = off
+      SGLANG_QSA_PACK_CACHE_CAP   rows per request region (default 32768)
+      SGLANG_QSA_PACK_CACHE_SLOTS concurrent regions (default max-running-req)
+    """
+
+    def __init__(self, req_to_token, slots_default: int, dtype, gen_table=None) -> None:
+        self.req_to_token = req_to_token
+        # Monotone per-row allocation counter owned by ReqToTokenPool.  A row
+        # index is reused the moment its request finishes, so ``req_rows`` alone
+        # cannot tell "same request, more chunks" from "new request on a
+        # recycled row"; the generation can.
+        self.gen_table = gen_table
+        self.dtype = dtype
+        self.budget = int(_env_float("SGLANG_QSA_PACK_CACHE_MB", 0.0) * 2**20)
+        self.cap = _env_int("SGLANG_QSA_PACK_CACHE_CAP", 32768)
+        slots = _env_int("SGLANG_QSA_PACK_CACHE_SLOTS", 0) or slots_default
+        self.slots_max = max(1, int(slots))
+        self.k: Dict[int, torch.Tensor] = {}
+        self.v: Dict[int, torch.Tensor] = {}
+        self.allocated = 0
+        self.req_slot: Dict[int, int] = {}
+        self.req_rows: Dict[int, int] = {}
+        self.req_gen: Dict[int, int] = {}
+        self.rows_total = 0
+        self.full_rows = 0
+        self.append_calls = 0
+        self._gen_key = None
+        self._gen_val = None
+        self.free = list(range(self.slots_max - 1, -1, -1))
+        self.disabled = not (self.budget > 0 and self.cap > 0)
+        self._refusals = 0
+        if self.disabled:
+            print(
+                f"[PKC] pack arena off (budget={self.budget / 2**20:.0f}MiB "
+                f"cap={self.cap} slots={self.slots_max}) -> full repack path",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    # -- bookkeeping -----------------------------------------------------
+    def _disable(self, why: str) -> None:
+        self.disabled = True
+        print(
+            f"[PKC] pack arena disabled: {why} "
+            f"(cap={self.cap} slots={self.slots_max} "
+            f"budget={self.budget / 2**20:.0f}MiB "
+            f"allocated={self.allocated / 2**20:.0f}MiB)",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Hand back whatever was already allocated: a mid-prefill disable must
+        # not leave a half-sized arena holding VRAM for the rest of the run.
+        self.k.clear()
+        self.v.clear()
+        self.req_slot.clear()
+        self.req_rows.clear()
+        self.req_gen.clear()
+        self.allocated = 0
+
+    def _layer_buffers(self, layer_id: int, k, v):
+        pk = self.k.get(layer_id)
+        if pk is not None:
+            return pk, self.v[layer_id]
+        heads, dim = k.shape[1:]
+        item = torch.tensor([], dtype=self.dtype).element_size()
+        per = self.slots_max * self.cap * heads * dim * item
+        need = 2 * per
+        if self.allocated + need > self.budget:
+            self._disable(
+                f"layer {layer_id} needs {need / 2**20:.0f}MiB, "
+                f"budget left {(self.budget - self.allocated) / 2**20:.0f}MiB"
+            )
+            return None
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info()
+        except Exception:  # noqa: BLE001
+            free_bytes = 0
+        if free_bytes and free_bytes < need * 1.25:
+            self._disable(
+                f"layer {layer_id} needs {need / 2**20:.0f}MiB, "
+                f"device free {free_bytes / 2**20:.0f}MiB"
+            )
+            return None
+        try:
+            pk = torch.empty(
+                (self.slots_max * self.cap, heads, dim),
+                dtype=self.dtype,
+                device=k.device,
+            )
+            pv = torch.empty(
+                (self.slots_max * self.cap, heads, dim),
+                dtype=self.dtype,
+                device=v.device,
+            )
+        except torch.cuda.OutOfMemoryError:
+            self._disable(f"layer {layer_id} OOM on {need / 2**20:.0f}MiB")
+            return None
+        self.k[layer_id] = pk
+        self.v[layer_id] = pv
+        self.allocated += need
+        print(
+            f"[PKC] layer {layer_id} region {self.slots_max}x{self.cap} rows, "
+            f"{need / 2**20:.1f}MiB (total {self.allocated / 2**20:.1f}MiB)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return pk, pv
+
+    def _generations(self, req_pool_indices, key=None):
+        """Allocation generation per row, or None if the pool has none.
+
+        ``pack`` runs once per full-attention layer per forward, and reading the
+        table is a device sync, so the answer is memoised per forward (``key``)
+        rather than paid 12 times.
+        """
+        if self.gen_table is None:
+            return None
+        if key is not None and key == self._gen_key:
+            return self._gen_val
+        try:
+            idx = req_pool_indices
+            if idx.device != self.gen_table.device:
+                idx = idx.to(self.gen_table.device)
+            val = [int(x) for x in self.gen_table[idx].tolist()]
+        except Exception:  # noqa: BLE001
+            return None
+        if key is not None:
+            self._gen_key, self._gen_val = key, val
+        return val
+
+    def release(self) -> None:
+        """Drop every region (called when prefill hands off to decode)."""
+        if self.req_slot or self.k:
+            full, got = self.full_rows, self.rows_total
+            saved = 100.0 * (1.0 - got / full) if full else 0.0
+            print(
+                f"[PKC] release {len(self.k)} layer region(s), "
+                f"{self.allocated / 2**20:.1f}MiB; gathered {got} rows in "
+                f"{self.append_calls} packs vs {full} rows for full repack "
+                f"(saved {saved:.1f}%)",
+                file=sys.stderr,
+                flush=True,
+            )
+        self.k.clear()
+        self.v.clear()
+        self.allocated = 0
+        self.req_slot.clear()
+        self.req_gen.clear()
+        self.rows_total = self.full_rows = self.append_calls = 0
+        self.req_rows.clear()
+        self.free = list(range(self.slots_max - 1, -1, -1))
+
+    # -- pack ------------------------------------------------------------
+    def pack(
+        self,
+        layer_id: int,
+        req_pool_indices,
+        prefix_lens,
+        sequence_lens,
+        k_buf,
+        v_buf,
+        tier_kwargs,
+    ):
+        """Append this chunk's rows, or return None to use the full repack."""
+        if self.disabled:
+            return None
+        if k_buf.dtype != self.dtype or v_buf.dtype != self.dtype:
+            self._disable(f"kv dtype {k_buf.dtype}/{v_buf.dtype} != arena {self.dtype}")
+            return None
+        longest = max(sequence_lens, default=0)
+        if longest > self.cap:
+            # The arena may not have allocated anything yet (no layer buffers),
+            # so take the geometry from the KV tensors rather than ``self``.
+            heads, dim = k_buf.shape[1:]
+            item = torch.tensor([], dtype=self.dtype).element_size()
+            per_mib = self.slots_max * longest * heads * dim * item / 2**20
+            self._disable(
+                f"seq_len {longest} > cap {self.cap}; {self.slots_max} regions that "
+                f"long would need {per_mib:.0f}MiB per full-attention layer"
+            )
+            return None
+        ids = [int(x) for x in req_pool_indices.tolist()]
+        if len(set(ids)) != len(ids):
+            return None
+        gens = self._generations(
+            req_pool_indices, key=(tuple(ids), tuple(prefix_lens))
+        )
+        if gens is None:
+            self._disable("ReqToTokenPool.req_generation unavailable (row reuse "
+                          "cannot be detected)")
+            return None
+        append = True
+        for rid, pre, gen in zip(ids, prefix_lens, gens):
+            if (
+                self.req_slot.get(rid) is None
+                or self.req_rows.get(rid, -1) != pre
+                or self.req_gen.get(rid, -1) != gen
+            ):
+                append = False
+                break
+        bases, starts, rows = [], [], []
+        for rid, pre, seq in zip(ids, prefix_lens, sequence_lens):
+            slot = self.req_slot.get(rid)
+            if slot is None:
+                if not self.free:
+                    self._disable(f"no free region for request {rid}")
+                    return None
+                slot = self.free.pop()
+                self.req_slot[rid] = slot
+                self.req_rows[rid] = -1
+            bases.append(slot * self.cap)
+            starts.append(pre if append else 0)
+            rows.append(seq - pre if append else seq)
+        pk, pv = self._layer_buffers(layer_id, k_buf, v_buf)
+        if pk is None:
+            return None
+        dev = k_buf.device
+        base_t = torch.tensor(bases, dtype=torch.int32, device=dev)
+        start_t = torch.tensor(starts, dtype=torch.int32, device=dev)
+        rows_t = torch.tensor(rows, dtype=torch.int32, device=dev)
+        pack_qsa_prefill_kv_range(
+            k=k_buf,
+            v=v_buf,
+            packed_k=pk,
+            packed_v=pv,
+            req_to_token=self.req_to_token,
+            req_indices=req_pool_indices,
+            req_base=base_t,
+            req_start=start_t,
+            req_rows=rows_t,
+            max_rows=max(rows, default=0),
+            **tier_kwargs,
+        )
+        for rid, seq, gen in zip(ids, sequence_lens, gens):
+            self.req_rows[rid] = seq
+            self.req_gen[rid] = gen
+        cu = torch.cat(
+            [
+                base_t,
+                torch.tensor(
+                    [bases[-1] + sequence_lens[-1]], dtype=torch.int32, device=dev
+                ),
+            ]
+        )
+        self.rows_total += sum(rows)
+        self.full_rows += sum(sequence_lens)
+        self.append_calls += 1
+        return pk, pv, cu
+
+
 class QwenSparseAttnBackend(AttentionBackend):
     """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
 
@@ -254,6 +590,18 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._verify_mask = None
+        self._pack_timing = QsaPackTiming()
+        if self._pack_timing.on:
+            atexit.register(self._pack_timing.flush)
+        self._pack_verify = _env_int("SGLANG_QSA_PACK_VERIFY", 0)
+        self._pack_verify_calls = 0
+        self._pack_verify_state = {"calls": 0, "mismatch": 0, "maxdiff": 0.0}
+        self._pack_arena = QsaPackArena(
+            self.req_to_token,
+            int(getattr(runner, "max_running_requests", 0) or 3),
+            torch.bfloat16,
+            gen_table=getattr(self.req_to_token_pool, "req_generation", None),
+        )
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1542,6 +1890,70 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        ev = self._pack_timing.start()
+        packed_k, packed_v, cu_k_view = self._pack_extend_kv(
+            q,
+            layer,
+            forward_batch,
+            prefix_lens,
+            sequence_lens,
+            cu_seqlens_k,
+            pool,
+        )
+        self._pack_timing.stop("pack", ev, rows=sum(sequence_lens))
+        ev = self._pack_timing.start()
+        output = sparse_gqa_fwd_interface_triton_ck(
+            q.contiguous(),
+            packed_k,
+            packed_v,
+            topk_indices,
+            cu_seqlens_q,
+            cu_k_view,
+            sequence_lens_tensor,
+            layer.scaling,
+        )
+        self._pack_timing.stop("attn", ev)
+        return self._pad_extend_output(output, num_output_rows)
+
+    def _pack_extend_kv(
+        self,
+        q,
+        layer,
+        forward_batch,
+        prefix_lens,
+        sequence_lens,
+        cu_seqlens_k,
+        pool,
+    ):
+        """Packed K/V for this chunk plus the ``cu_k`` the sparse kernel reads.
+
+        Two interchangeable producers, same bytes:
+
+        * ``QsaPackArena`` when ``SGLANG_QSA_PACK_CACHE_MB`` is set and every
+          request's region is resident: gathers only this chunk's rows and
+          returns each request's fixed region base as ``cu_k``.
+        * ``pack_qsa_prefill_kv`` otherwise: re-gathers the whole prefix into a
+          fresh buffer, i.e. the O(N^2/c) path this experiment is measuring.
+        """
+        tier = self._hisparse_tier_kwargs(layer)
+        arena = self._pack_arena
+        if arena is not None and not arena.disabled:
+            got = arena.pack(
+                layer.layer_id,
+                forward_batch.req_pool_indices,
+                prefix_lens,
+                sequence_lens,
+                pool.get_key_buffer(layer.layer_id),
+                pool.get_value_buffer(layer.layer_id),
+                tier,
+            )
+            if got is not None:
+                if self._pack_verify:
+                    self._verify_pack(
+                        q, layer, forward_batch, got, prefix_lens, sequence_lens,
+                        cu_seqlens_k, pool, tier,
+                    )
+                return got
         packed_k, packed_v = pack_qsa_prefill_kv(
             k=pool.get_key_buffer(layer.layer_id),
             v=pool.get_value_buffer(layer.layer_id),
@@ -1551,19 +1963,69 @@ class QwenSparseAttnBackend(AttentionBackend):
             total_k=sum(sequence_lens),
             max_k=max(sequence_lens, default=1),
             output_dtype=q.dtype,
-            **self._hisparse_tier_kwargs(layer),
+            **tier,
         )
-        output = sparse_gqa_fwd_interface_triton_ck(
-            q.contiguous(),
-            packed_k,
-            packed_v,
-            topk_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            sequence_lens_tensor,
-            layer.scaling,
+        return packed_k, packed_v, cu_seqlens_k
+
+    def _verify_pack(
+        self,
+        q,
+        layer,
+        forward_batch,
+        got,
+        prefix_lens,
+        sequence_lens,
+        cu_seqlens_k,
+        pool,
+        tier,
+    ):
+        """Bitwise-compare the append-only regions against a full repack.
+
+        ``SGLANG_QSA_PACK_VERIFY=1`` only: costs one extra full gather per call,
+        which is exactly the work the arena removes, so never mix it with a
+        timing run.  Reports per-call equality and the first mismatch.
+        """
+        full_k, full_v = pack_qsa_prefill_kv(
+            k=pool.get_key_buffer(layer.layer_id),
+            v=pool.get_value_buffer(layer.layer_id),
+            req_to_token=self.req_to_token_pool.req_to_token,
+            req_indices=forward_batch.req_pool_indices,
+            cu_k=cu_seqlens_k,
+            total_k=sum(sequence_lens),
+            max_k=max(sequence_lens, default=1),
+            output_dtype=q.dtype,
+            **tier,
         )
-        return self._pad_extend_output(output, num_output_rows)
+        arena_k, arena_v, bases = got
+        state = self._pack_verify_state
+        state["calls"] += 1
+        for i, seq in enumerate(sequence_lens):
+            base = int(bases[i])
+            off = int(cu_seqlens_k[i])
+            for name, a_buf, b_buf in (("k", arena_k, full_k), ("v", arena_v, full_v)):
+                a = a_buf[base : base + seq]
+                b = b_buf[off : off + seq]
+                if not torch.equal(a, b):
+                    diff = (a.float() - b.float()).abs().max().item()
+                    state["mismatch"] += 1
+                    state["maxdiff"] = max(state["maxdiff"], diff)
+                    if state["mismatch"] <= 3:
+                        print(
+                            f"[PKV] MISMATCH layer={layer.layer_id} req#{i} "
+                            f"{name} seq={seq} base={base} off={off} "
+                            f"maxdiff={diff:.3e}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+        # Print early and often: a 3-chunk 258K-style request only produces a
+        # few dozen verifications, so a %64 cadence would stay silent.
+        if state["calls"] <= 2 or state["calls"] % 8 == 0:
+            print(
+                f"[PKV] verify calls={state['calls']} "
+                f"mismatch={state['mismatch']} maxdiff={state['maxdiff']:.3e}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _forward_extend_cp(
         self,
@@ -1874,6 +2336,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
+        if self._pack_timing.on and self._pack_timing.pending:
+            # Prefill just handed off to decode: flush the pack/attn tail now,
+            # because a container stop is a SIGKILL and atexit never runs.
+            self._pack_timing.flush()
+        if self._pack_arena is not None:
+            # Prefill for every queued request is done: the resident packed
+            # regions are dead weight from here on (report contract: freed when
+            # the request leaves prefill).  Also reclaims a partially allocated
+            # arena that was disabled mid-way, and is a no-op once empty.
+            self._pack_arena.release()
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
