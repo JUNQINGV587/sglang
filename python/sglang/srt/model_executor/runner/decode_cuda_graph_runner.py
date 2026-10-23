@@ -1150,6 +1150,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
+        from sglang.srt.layers.attention.qsa import cfx_debug  # noqa: PLC0415
+
+        cfx_debug.mark("capture:warmup_done")
         with freeze_gc(get_exec().graph.enable_cudagraph_gc):
             if not self.enable_pdmux:
                 with (
@@ -1159,8 +1162,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     profile_context as prof,
                 ):
                     self.stream = graph_capture_context.stream
+                    cfx_debug.mark("capture:region_entered")
                     with self.backend.capture_session(self.stream):
                         self._capture_one_stream()
+                    cfx_debug.mark("capture:region_done")
             else:
                 for i, sg in enumerate(self.stream_groups):
                     with (
@@ -1246,9 +1251,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "Breakable CUDA graph is required for --debug-cuda-graph"
             )
 
+        from sglang.srt.layers.attention.qsa import cfx_debug  # noqa: PLC0415
+
+        cfx_debug.mark(f"shape:{bs}:prepare_start")
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
+        cfx_debug.mark(f"shape:{bs}:prepare_done")
+        cfx_debug.dump_batch(forward_batch, f"capture_bs{bs}")
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -1262,9 +1272,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            cfx_debug.mark(f"shape:{bs}:metadata_out_graph_done")
 
             def run_once():
                 # Debug replay retains this callback beyond the capture scope.
+                cfx_debug.mark(f"shape:{bs}:run_once_enter")
                 with forward_context(
                     ForwardContext(attn_backend=attn_backend),
                     forward_batch=forward_batch,
@@ -1272,6 +1284,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     # Backends may gather live pool mappings into their static
                     # metadata here; these nodes run before any model KV reads.
                     attn_backend.init_forward_metadata_in_graph(forward_batch)
+                    cfx_debug.mark(f"shape:{bs}:metadata_in_graph_done")
                     self._record_in_graph_metadata_prep_done()
 
                     forward_batch.dp_local_start_pos = (
@@ -1322,6 +1335,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         forward_batch,
                         **kwargs,
                     )
+                    cfx_debug.mark(f"shape:{bs}:forward_returned")
                     for capture_hook in self.model_runner.capture_tail_hooks:
                         capture_hook(self, out, forward_batch, num_tokens)
                     return out
@@ -1358,6 +1372,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+                cfx_debug.mark(f"shape:{bs}:capture_one_done")
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
         # An idle DP rank replays a fabricated batch whose count may not reach

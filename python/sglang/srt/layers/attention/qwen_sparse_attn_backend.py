@@ -1341,9 +1341,25 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         if not getattr(pool, "is_hisparse_qsa", False):
             return {}
+        from sglang.srt.layers.attention.qsa import cfx_debug  # noqa: PLC0415
+
+        cfx_debug.dump_pool(pool, "tier_kwargs")
+        if cfx_debug.flag("SGLANG_QSA_CFX_NO_HOST"):
+            cfx_debug.mark("tier_kwargs:no_host", f"layer={layer.layer_id}")
+            return {}
+        host_k = pool.get_host_key_buffer(layer.layer_id)
+        host_v = pool.get_host_value_buffer(layer.layer_id)
+        if cfx_debug.once(f"tier:{layer.layer_id}"):
+            cfx_debug.mark(
+                "tier_kwargs",
+                f"layer={layer.layer_id} host_k=0x{host_k.data_ptr():x}"
+                f" host_v=0x{host_v.data_ptr():x}"
+                f" rows={host_k.shape[0]} pinned={host_k.is_pinned()}"
+                f" resident={pool.hisparse_resident_tokens}",
+            )
         return {
-            "host_k": pool.get_host_key_buffer(layer.layer_id),
-            "host_v": pool.get_host_value_buffer(layer.layer_id),
+            "host_k": host_k,
+            "host_v": host_v,
             "resident_tokens": pool.hisparse_resident_tokens,
         }
 

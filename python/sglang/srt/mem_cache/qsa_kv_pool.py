@@ -448,13 +448,26 @@ class HiSparseQSATokenToKVPool(QSATokenToKVPool):
         loc, _, full_loc = unwrap_write_loc(loc_info)
         logical = loc if full_loc is None else full_loc
         layer_id = self._transfer_full_attention_id(layer.layer_id)
-        host_k = self.host_key_buffer_pool[layer_id]
-        host_v = self.host_value_buffer_pool[layer_id]
-        ck = cache_k.to(host_k.dtype)
-        cv = cache_v.to(host_v.dtype)
-        host_idx = logical.to("cpu", non_blocking=False)
-        host_k[host_idx] = ck.to("cpu", non_blocking=False)
-        host_v[host_idx] = cv.to("cpu", non_blocking=False)
+        from sglang.srt.layers.attention.qsa import cfx_debug  # noqa: PLC0415
+
+        if cfx_debug.flag("SGLANG_QSA_CFX_NO_KV_WRITE"):
+            if cfx_debug.once(f"skip:{layer.layer_id}"):
+                cfx_debug.mark(
+                    "set_kv_buffer:skipped",
+                    f"layer={layer.layer_id} n={logical.numel()}"
+                    f" graph={torch.cuda.is_current_stream_capturing()}",
+                )
+            return
+        ck = cache_k
+        cv = cache_v
+        if not cfx_debug.flag("SGLANG_QSA_CFX_NO_HOST_WRITE"):
+            host_k = self.host_key_buffer_pool[layer_id]
+            host_v = self.host_value_buffer_pool[layer_id]
+            ck = cache_k.to(host_k.dtype)
+            cv = cache_v.to(host_v.dtype)
+            host_idx = logical.to("cpu", non_blocking=False)
+            host_k[host_idx] = ck.to("cpu", non_blocking=False)
+            host_v[host_idx] = cv.to("cpu", non_blocking=False)
         if self.hisparse_resident_tokens <= 0:
             return
         resident = logical < self.hisparse_resident_tokens
