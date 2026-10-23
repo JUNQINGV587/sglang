@@ -13,6 +13,8 @@ from contextlib import nullcontext
 from typing import List, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
@@ -331,6 +333,36 @@ class QSATokenToKVPool(HybridLinearKVPool):
         return k_size + qsa_k_size, v_size
 
 
+
+@triton.jit
+def _qsa_host_kv_scatter_kernel(
+    k_ptr, v_ptr, hk_ptr, hv_ptr, idx_ptr,
+    n_rows, row_dim: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """Scatter device K/V rows into the pinned host mirror (capture-safe).
+
+    The host mirror is plain pinned memory, which UVA keeps device-addressable,
+    so a device kernel can write it directly — no D2H copy, no host sync, and
+    therefore no ``cudaErrorStreamCaptureInvalidated`` when this runs inside a
+    decode CUDA graph.
+    """
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    dst = tl.load(idx_ptr + row)
+    if dst < 0:
+        return
+    hk = hk_ptr.to(tl.pointer_type(tl.bfloat16))
+    hv = hv_ptr.to(tl.pointer_type(tl.bfloat16))
+    for c in range(0, row_dim, BLOCK):
+        cols = c + tl.arange(0, BLOCK)
+        m = cols < row_dim
+        off_src = row * row_dim + cols
+        off_dst = dst * row_dim + cols
+        tl.store(hk + off_dst, tl.load(k_ptr + off_src, mask=m, other=0.0), mask=m)
+        tl.store(hv + off_dst, tl.load(v_ptr + off_src, mask=m, other=0.0), mask=m)
+
+
 class HiSparseQSATokenToKVPool(QSATokenToKVPool):
     """QSA pool with a host tier for the full-attention K/V.
 
@@ -377,6 +409,12 @@ class HiSparseQSATokenToKVPool(QSATokenToKVPool):
         # The identity window can only cover rows the device tier really has
         # (the full KV pool was sized for ``size`` device slots).
         self.hisparse_resident_tokens = min(int(resident_tokens), self.size)
+        # Static (allocation-time) answer to "can any logical slot ever be read
+        # from the host tier?".  When the resident window covers the whole
+        # logical space the host mirror is unreachable on the read path, so the
+        # write path can skip it entirely -- which also keeps the write legal
+        # inside a decode CUDA graph (capture forbids D2H and host syncs).
+        self._host_tier_in_use = self.hisparse_resident_tokens < self._logical_size
         # Host rows are addressed by logical slot id, so there is one row per
         # logical slot plus the base pool's padding page.  Pinned memory keeps
         # the zero-copy device reads cheap; rows are bf16 like the device tier.
@@ -460,15 +498,41 @@ class HiSparseQSATokenToKVPool(QSATokenToKVPool):
             return
         ck = cache_k
         cv = cache_v
-        if not cfx_debug.flag("SGLANG_QSA_CFX_NO_HOST_WRITE"):
+        if self._host_tier_in_use and not cfx_debug.flag(
+            "SGLANG_QSA_CFX_NO_HOST_WRITE"
+        ):
             host_k = self.host_key_buffer_pool[layer_id]
             host_v = self.host_value_buffer_pool[layer_id]
             ck = cache_k.to(host_k.dtype)
             cv = cache_v.to(host_v.dtype)
-            host_idx = logical.to("cpu", non_blocking=False)
-            host_k[host_idx] = ck.to("cpu", non_blocking=False)
-            host_v[host_idx] = cv.to("cpu", non_blocking=False)
+            n_rows = int(logical.numel())
+            if n_rows and host_k.dtype == torch.bfloat16:
+                row_dim = int(host_k.shape[1] * host_k.shape[2])
+                _qsa_host_kv_scatter_kernel[(n_rows,)](
+                    ck.reshape(n_rows, row_dim),
+                    cv.reshape(n_rows, row_dim),
+                    host_k.data_ptr(),
+                    host_v.data_ptr(),
+                    logical,
+                    n_rows,
+                    row_dim=row_dim,
+                    BLOCK=min(1024, triton.next_power_of_2(row_dim)),
+                    num_warps=4,
+                )
+            else:
+                host_idx = logical.to("cpu", non_blocking=False)
+                host_k[host_idx] = ck.to("cpu", non_blocking=False)
+                host_v[host_idx] = cv.to("cpu", non_blocking=False)
         if self.hisparse_resident_tokens <= 0:
+            return
+        if not self._host_tier_in_use:
+            # Every logical slot is read back from the device tier, so this is a
+            # plain fixed-shape scatter: no host round trip, no device->host
+            # sync, hence legal inside a decode CUDA graph.
+            k_buf = self.full_kv_pool.k_buffer[layer_id]
+            v_buf = self.full_kv_pool.v_buffer[layer_id]
+            k_buf[logical] = cache_k.to(k_buf.dtype)
+            v_buf[logical] = cache_v.to(v_buf.dtype)
             return
         resident = logical < self.hisparse_resident_tokens
         if bool(resident.any()):
