@@ -222,6 +222,41 @@ class PleFileRssTrimmer:
         self._stop.set()
 
 
+def _alloc_exact_pinned(shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
+    """Pinned host tensor of exactly ``shape``/``dtype`` -- no power-of-two bin.
+
+    ``torch.empty(..., pin_memory=True)`` goes through the caching host
+    allocator, which rounds a request up to the next power of two: the 23.84 GiB
+    PLE table of Qwen3.8-Flash-Next costs 32 GiB of host RAM per rank, and that
+    wasted 8 GiB is exactly the margin the host KV tier and a second experiment
+    need. ``cudaHostAlloc`` takes the byte count literally; the tensor built on
+    top of it still reports ``is_pinned() == True`` because torch asks the driver
+    whether the pointer is pinned, so the existing H2D paths keep their fast
+    route. The allocation lives for the life of the process (one per boot).
+    """
+    numel = 1
+    for d in shape:
+        numel *= int(d)
+    nbytes = numel * torch.empty(0, dtype=dtype).element_size()
+
+    lib = ctypes.CDLL("libcudart.so")
+    ptr = ctypes.c_void_p()
+    rc = lib.cudaHostAlloc(ctypes.byref(ptr), ctypes.c_size_t(nbytes), ctypes.c_uint(0))
+    if rc != 0 or not ptr.value:
+        raise RuntimeError(f"cudaHostAlloc({nbytes} bytes) failed with rc={rc}")
+
+    owner = (ctypes.c_ubyte * nbytes).from_address(ptr.value)
+    table = torch.frombuffer(owner, dtype=torch.uint8, count=nbytes)
+    table = table.view(dtype).view(*[int(d) for d in shape])
+    # No free hook on purpose: a `weakref.finalize` that calls cudaFreeHost
+    # looked tidy but segfaulted the scheduler when the loader briefly rebound
+    # the parameter (the table is then re-registered after the pages are gone).
+    # One table per process, released by the driver at exit.
+    table._sglang_ple_exact_owner = owner  # keep the ctypes buffer alive
+    table._sglang_ple_exact_bytes = nbytes
+    return table
+
+
 def allocate_ple_host_table(
     shape: Sequence[int],
     dtype: torch.dtype,
@@ -241,6 +276,21 @@ def allocate_ple_host_table(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
     if backend == "pinned":
+        if envs.SGLANG_QWEN4_PLE_EXACT_PINNED.get():
+            try:
+                table = _alloc_exact_pinned(shape, dtype)
+                logger.info(
+                    "PLE table: exact pinned %.2f GiB via cudaHostAlloc (saves the "
+                    "power-of-two bin of torch's host allocator)",
+                    table._sglang_ple_exact_bytes / 2**30,
+                )
+                return table
+            except Exception as error:  # noqa: BLE001 - fall back, never fail boot
+                logger.warning(
+                    "PLE table: exact pinned allocation failed (%s); "
+                    "falling back to torch pinned (may waste host RAM)",
+                    error,
+                )
         return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
 
     numel = 1

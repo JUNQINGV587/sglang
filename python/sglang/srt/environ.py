@@ -305,6 +305,10 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
+    # ``--ple-offload-backend pinned``: allocate the table with cudaHostAlloc
+    # (exact byte count) instead of torch's caching host allocator, which
+    # rounds a request up to the next power of two (23.84 GiB -> 32 GiB).
+    SGLANG_QWEN4_PLE_EXACT_PINNED = EnvBool(True)
     # Faulting rows in maps whole page-cache folios, so the mapping creeps
     # towards full residency (~45 KB/token) and eats the free memory that
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
