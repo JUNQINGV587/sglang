@@ -138,6 +138,21 @@ logger = logging.getLogger(__name__)
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
 
+# Template switches that turn thinking off for the request-level retry the
+# empty-turn repair performs. A template reads the single key its model defines
+# and ignores the others, so setting them all keeps the retry model-agnostic.
+_THINKING_OFF_TEMPLATE_KWARGS = {
+    "enable_thinking": False,
+    "thinking": False,
+    "thinking_mode": "disabled",
+}
+# Visible output at or above this many non-whitespace characters counts as a
+# real answer; anything below it is still an empty turn.
+_EMPTY_TURN_MIN_VISIBLE_CHARS = 1
+# Cheap pre-filter for the streaming path: whitespace after a thinking block is
+# a couple of newline tokens, not an answer.
+_EMPTY_TURN_MAX_VISIBLE_TOKENS = 4
+
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
     detector = getattr(parser, "detector", parser)
@@ -2245,6 +2260,63 @@ class OpenAIServingChat(OpenAIServingBase):
                 ):
                     yield chunk
 
+            # Repair an empty terminal turn before reporting completion. A turn
+            # that stopped right after thinking with no visible text and no tool
+            # call leaves an agent client nothing to act on, so the run stalls
+            # even though the engine is healthy. Regenerate this one turn with
+            # thinking off and stream the answer as ordinary content chunks.
+            repaired_message = None
+            if self._empty_turn_repair_enabled() and len(finish_reasons) == 1:
+                empty_turn = False
+                if self._stream_turn_may_be_empty(
+                    finish_reasons[0]["type"],
+                    has_tool_calls.get(0, False),
+                    completion_tokens.get(0, 0),
+                    reasoning_tokens.get(0, 0),
+                ):
+                    try:
+                        # The token budget already narrowed this to a turn that
+                        # barely spoke; the built response then rules out the
+                        # few-tokens-but-real answer ("OK."). It sees the whole
+                        # text because streaming output is cumulative by default.
+                        empty_turn = self._response_is_empty_turn(
+                            self._build_chat_response(request, [content], created),
+                            content,
+                        )
+                    except Exception:
+                        logger.warning("Empty-turn detection failed", exc_info=True)
+                if empty_turn:
+                    repaired = await self._repair_empty_terminal_turn(
+                        request, raw_request
+                    )
+                    if repaired is not None and not self._response_is_empty_turn(
+                        repaired, None
+                    ):
+                        repaired_message = repaired.choices[0].message
+                        logger.warning(
+                            "Empty terminal turn (no visible text, no tool calls); "
+                            "retried once with thinking disabled."
+                        )
+                        if repaired_message.content:
+                            yield build_sse_content(
+                                chunk_id=content["meta_info"]["id"],
+                                created=created,
+                                model=request.model,
+                                index=0,
+                                content=repaired_message.content,
+                            )
+                        for position, call in enumerate(
+                            repaired_message.tool_calls or ()
+                        ):
+                            yield self._stream_tool_call_chunk(
+                                chunk_id=content["meta_info"]["id"],
+                                created=created,
+                                request=request,
+                                index=0,
+                                position=position,
+                                call=call,
+                            )
+
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
                 finish_reason_type = finish_reason_data["type"]
@@ -2256,6 +2328,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     and finish_reason_type == "stop"
                     and not _incomplete_tool_call_indices(parser_dict.get(idx))
                 ):
+                    final_finish_reason = "tool_calls"
+                if repaired_message is not None and repaired_message.tool_calls:
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
@@ -2434,7 +2508,138 @@ class OpenAIServingChat(OpenAIServingBase):
             int(time.time()),
         )
 
+        if (
+            self._empty_turn_repair_enabled()
+            and getattr(request, "n", 1) == 1
+            and self._response_is_empty_turn(response, ret[0])
+        ):
+            repaired = await self._repair_empty_terminal_turn(request, raw_request)
+            if repaired is not None and not self._response_is_empty_turn(
+                repaired, None
+            ):
+                logger.warning(
+                    "Empty terminal turn (no visible text, no tool calls); "
+                    "retried once with thinking disabled."
+                )
+                return repaired
+
         return response
+
+    # ------------------------------------------------------------------
+    # Empty terminal turn repair
+    # ------------------------------------------------------------------
+    def _empty_turn_repair_enabled(self) -> bool:
+        return not envs.SGLANG_DISABLE_EMPTY_TURN_REPAIR.get()
+
+    def _is_empty_terminal_turn(
+        self,
+        finish_reason: str | None,
+        content: str | None,
+        tool_call_count: int,
+        reasoning_tokens: int,
+        reasoning_text: str | None = None,
+    ) -> bool:
+        """Whether a finished turn carries nothing a client can act on.
+
+        Models do end a turn right after a thinking block: they close the
+        reasoning and stop on whitespace. The visible answer is empty, so an
+        agent client treats the turn as dead even though the work was done.
+        """
+        if finish_reason != "stop" or tool_call_count:
+            return False
+        if len((content or "").strip()) >= _EMPTY_TURN_MIN_VISIBLE_CHARS:
+            return False
+        # Only repair turns the model talked itself into. Without any reasoning
+        # an empty answer may be exactly what the request asked for.
+        return bool(reasoning_tokens) or bool((reasoning_text or "").strip())
+
+    def _response_is_empty_turn(self, response, ret_item) -> bool:
+        """Apply the empty-turn check to a built (non-streaming) response."""
+        if not isinstance(response, ChatCompletionResponse) or not response.choices:
+            return False
+        choice = response.choices[0]
+        message = choice.message
+        meta_info = (ret_item or {}).get("meta_info") or {}
+        return self._is_empty_terminal_turn(
+            choice.finish_reason,
+            message.content,
+            len(message.tool_calls or ()),
+            int(meta_info.get("reasoning_tokens") or 0),
+            getattr(message, "reasoning_content", None),
+        )
+
+    def _stream_turn_may_be_empty(
+        self,
+        finish_reason_type: str | None,
+        has_tool_calls: bool,
+        completion_tokens: int,
+        reasoning_tokens: int,
+    ) -> bool:
+        """Cheap pre-filter so the streaming path only parses suspect turns."""
+        if finish_reason_type != "stop" or has_tool_calls or reasoning_tokens <= 0:
+            return False
+        return completion_tokens - reasoning_tokens <= _EMPTY_TURN_MAX_VISIBLE_TOKENS
+
+    def _stream_tool_call_chunk(
+        self,
+        chunk_id: str,
+        created: int,
+        request: ChatCompletionRequest,
+        index: int,
+        position: int,
+        call: ToolCall,
+    ) -> str:
+        """Emit one complete tool call the streaming repair recovered."""
+        tool_call = ToolCall(
+            id=call.id,
+            index=call.index if call.index is not None else position,
+            function=FunctionResponse(
+                name=call.function.name,
+                arguments=call.function.arguments,
+            ),
+        )
+        chunk = ChatCompletionStreamResponse(
+            id=chunk_id,
+            created=created,
+            choices=[
+                ChatCompletionResponseStreamChoice(
+                    index=index,
+                    delta=DeltaMessage(tool_calls=[tool_call]),
+                    finish_reason=None,
+                )
+            ],
+            model=request.model,
+        )
+        return f"data: {chunk.model_dump_json()}\n\n"
+
+    async def _repair_empty_terminal_turn(self, request, raw_request):
+        """Regenerate one degenerate turn with thinking switched off.
+
+        Bounded and defensive: exactly one extra generation, and any failure
+        falls back to the original answer instead of breaking the request.
+        """
+        try:
+            repair_request = request.model_copy(deep=True)
+            repair_request.stream = False
+            repair_request.stream_options = None
+            template_kwargs = dict(repair_request.chat_template_kwargs or {})
+            template_kwargs.update(_THINKING_OFF_TEMPLATE_KWARGS)
+            repair_request.chat_template_kwargs = template_kwargs
+            if repair_request.reasoning_effort is not None:
+                repair_request.reasoning_effort = "none"
+            adapted_request, repair_request = self._convert_to_internal_request(
+                repair_request, raw_request
+            )
+            ret = await self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__()
+        except Exception:
+            logger.warning("Empty-turn repair failed", exc_info=True)
+            return None
+
+        if not isinstance(ret, list):
+            ret = [ret]
+        return self._build_chat_response(repair_request, ret, int(time.time()))
 
     def _build_chat_response(
         self,
