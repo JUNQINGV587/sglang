@@ -1661,6 +1661,7 @@ class PrefillAdder:
         self.can_run_list.append(req)
         if admission.is_chunked:
             self.new_chunked_req = req
+            self.new_chunked_reqs.append(req)
         self._update_prefill_budget(
             admission.prefix_len,
             admission.extend_len,
