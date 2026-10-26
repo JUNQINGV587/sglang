@@ -913,13 +913,7 @@ class BaseMultimodalProcessor(ABC):
             if bos and input_text.startswith(bos):
                 kwargs.setdefault("add_special_tokens", False)
 
-        with self._temporary_fast_processor_cuda_pool(processor_device):
-            result = processor.__call__(
-                text=[input_text],
-                padding=True,
-                return_tensors="pt",
-                **kwargs,
-            )
+        def _transfer_mm_features_off_device(result: dict) -> None:
             # Deferred: the hash is computed on the GPU tensor first, and
             # _precompute_hashes_before_cpu_transfer moves it down afterwards.
             if (
@@ -932,6 +926,39 @@ class BaseMultimodalProcessor(ABC):
                         result[feature_name], torch.Tensor
                     ):
                         result[feature_name] = result[feature_name].to("cpu")
+
+        try:
+            with self._temporary_fast_processor_cuda_pool(processor_device):
+                result = processor.__call__(
+                    text=[input_text],
+                    padding=True,
+                    return_tensors="pt",
+                    **kwargs,
+                )
+                _transfer_mm_features_off_device(result)
+        except torch.OutOfMemoryError:
+            # The fast image processor runs on the serving device but owns no
+            # reserved budget: when the scheduler has filled the device (a
+            # mem-fraction-static sized to the weights leaves a few hundred MiB)
+            # a request carrying several images cannot grow its temporary pool
+            # and the whole request used to fail with a 500.  Preprocessing is
+            # an optimization, not a correctness requirement, so retry this
+            # request's media on the CPU instead of failing it.
+            if processor_device in (None, "cpu") or self.keep_mm_features_on_device:
+                raise
+            logger.warning(
+                "Fast image processor ran out of GPU memory on %s; "
+                "retrying this request's media preprocessing on CPU.",
+                processor_device,
+            )
+            kwargs["device"] = "cpu"
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+            _transfer_mm_features_off_device(result)
 
         return result
 
