@@ -2507,7 +2507,76 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return False
 
+    if success:
+        _warmup_long_prefill(url, headers, ssl_verify, model_info)
+
     return success
+
+
+# Nine plain-English words; the tokenizer renders them as (about) nine tokens.
+_LONG_PREFILL_WORDS = "the quick brown fox jumps over the lazy dog."
+_LONG_PREFILL_TOKENS_PER_REPEAT = 9
+
+
+def _long_warmup_prompt(target_tokens: int) -> str:
+    """Build a plain-text prompt of roughly ``target_tokens`` tokens."""
+    repeats = max(1, -(-target_tokens // _LONG_PREFILL_TOKENS_PER_REPEAT))
+    return " ".join([_LONG_PREFILL_WORDS] * repeats)
+
+
+def _warmup_long_prefill(
+    url: str, headers: dict, ssl_verify: bool, model_info: dict
+) -> None:
+    """Send one long prompt through the real scheduler path.
+
+    Triton kernels that only a long prefill reaches (the linear-attention
+    chunked recurrence, its fused conv/norm kernels, the packed QSA attention)
+    would otherwise be compiled on the first real long request, i.e. after the
+    KV pool has consumed the free memory, where a driver-side allocation
+    failure is far more likely. Compiling them here keeps that work inside the
+    window where the device is still mostly free.
+    """
+    target_tokens = envs.SGLANG_PREFILL_WARMUP_TOKENS.get()
+    if target_tokens <= 0:
+        return
+    if not model_info.get("is_generation") or get_serving().skip_tokenizer_init:
+        return
+    if get_disagg().disaggregation_mode != "null":
+        return
+
+    payload = {
+        "text": _long_warmup_prompt(target_tokens),
+        "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+    }
+    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    started = time.time()
+    try:
+        res = requests.post(
+            url + "/generate",
+            json=payload,
+            headers=headers,
+            timeout=warmup_timeout if warmup_timeout > 0 else 600,
+            verify=ssl_verify,
+        )
+        res.raise_for_status()
+        prompt_tokens = res.json().get("meta_info", {}).get("prompt_tokens")
+        if isinstance(prompt_tokens, int) and prompt_tokens > 4 * target_tokens:
+            logger.warning(
+                "Long prefill warmup prompt is %d tokens, far above the %d-token "
+                "target; check _LONG_PREFILL_TOKENS_PER_REPEAT.",
+                prompt_tokens,
+                target_tokens,
+            )
+        logger.info(
+            "Prefill kernel warmup: %s-token prompt through the scheduler in %.1fs.",
+            prompt_tokens if prompt_tokens is not None else "long",
+            time.time() - started,
+        )
+    except Exception:
+        logger.warning(
+            "Long prefill warmup failed; long prompts may still compile kernels late.",
+            exc_info=True,
+        )
 
 
 def _tokenizer_worker_gc_callback(worker_id: int, gc_threshold) -> Callable[[], None]:

@@ -1296,6 +1296,13 @@ class Envs:
     SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
     SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
     SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
+    # Run one dummy prefill of this many tokens during engine init so the
+    # prefill-shaped Triton specializations (chunked linear attention, conv1d,
+    # sparse prefill attention, QSA packing) compile and load their cubins while
+    # the pools are still empty. 0 disables the pass. A cubed prefill first
+    # used mid-serving has to load its cubin with the engine at 0-1 GiB free,
+    # which is where cuModuleLoadData dies with CUDA OOM.
+    SGLANG_PREFILL_WARMUP_TOKENS = EnvInt(0)
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)

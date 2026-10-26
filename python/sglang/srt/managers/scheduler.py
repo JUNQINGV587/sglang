@@ -1958,10 +1958,12 @@ class Scheduler(
 
         The event loop blocks until shutdown.
         """
-        # Engine init (graph capture, warmups) is done; from here on any
-        # Triton kernel device-load is a lazy first-use at serving time.
+        # Engine init (graph capture, warmups) is done. The serving-started
+        # mark is deferred until the launcher finishes its request-driven
+        # warmup (see handle_freeze_gc): that warmup exists precisely to compile
+        # the kernels a first long prefill needs, so counting it as lazy
+        # first-use would report it as a late load.
         triton_load_watch.install()
-        triton_load_watch.mark_serving_started()
 
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
@@ -6139,6 +6141,8 @@ class Scheduler(
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
+        # The launcher sends this right after its warmup requests complete.
+        triton_load_watch.mark_serving_started()
         freeze_gc("Scheduler", recv_req.gc_threshold)
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None

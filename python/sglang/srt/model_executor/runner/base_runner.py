@@ -284,6 +284,15 @@ class BaseRunner(ABC):
             self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
             maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
 
+        # Compile the prefill-shaped Triton specializations now, while the pools
+        # are still empty: a first long prompt would otherwise load their cubins
+        # with the engine at 0-1 GiB free (see triton_load_watch).
+        from sglang.srt.model_executor.runner.prefill_warmup import (
+            warmup_prefill_kernels,
+        )
+
+        warmup_prefill_kernels(self)
+
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -470,6 +479,7 @@ class BaseRunner(ABC):
         *,
         buffers,
         extend_num_tokens_per_req: Optional[int] = None,
+        extend_prefix_len: int = 0,
     ):
         """Run a dummy forward pass for warmup/profiling.
 
@@ -590,16 +600,16 @@ class BaseRunner(ABC):
                 per_req_extend_len = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
             else:
                 per_req_extend_len = extend_num_tokens_per_req
-                seq_lens.fill_(per_req_extend_len)
-                seq_lens_cpu.fill_(per_req_extend_len)
-            extend_prefix_lens_cpu = [0] * batch_size
+                seq_lens.fill_(extend_prefix_len + per_req_extend_len)
+                seq_lens_cpu.fill_(extend_prefix_len + per_req_extend_len)
+            extend_prefix_lens_cpu = [extend_prefix_len] * batch_size
             extend_seq_lens_cpu = [per_req_extend_len] * batch_size
             extend_num_tokens = num_tokens
             extend_seq_lens = torch.full(
                 (batch_size,), per_req_extend_len, dtype=torch.int32, device=mr.device
             )
-            extend_prefix_lens = torch.zeros(
-                (batch_size,), dtype=torch.int32, device=mr.device
+            extend_prefix_lens = torch.full(
+                (batch_size,), extend_prefix_len, dtype=torch.int32, device=mr.device
             )
             extend_start_loc = torch.arange(
                 0, num_tokens, num_tokens_per_req, dtype=torch.int32, device=mr.device
