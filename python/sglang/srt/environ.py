@@ -1303,6 +1303,13 @@ class Envs:
     # used mid-serving has to load its cubin with the engine at 0-1 GiB free,
     # which is where cuModuleLoadData dies with CUDA OOM.
     SGLANG_PREFILL_WARMUP_TOKENS = EnvInt(0)
+    # Allow --enable-hisparse together with the radix prefix cache on Qwen4-Exp
+    # QSA. The QSA host tier is a pure address-translation mask (every logical
+    # slot stays readable from the device window or the pinned host mirror), so
+    # it does not need the DSA swap coordinator that the --disable-radix-cache
+    # assertion protects. Off by default because the hybrid SSM radix
+    # components have never been exercised on this pool.
+    SGLANG_QSA_HISPARSE_RADIX = EnvBool(False)
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)

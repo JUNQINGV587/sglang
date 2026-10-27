@@ -114,9 +114,23 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "Qwen4-Exp QSA now. "
     )
 
-    assert cfg.disable_radix_cache, (
-        "Hierarchical sparse attention currently requires --disable-radix-cache."
-    )
+    # QSA's host tier is a static address-translation mask over a pool whose
+    # logical slots stay readable (device window or pinned host mirror), so a
+    # radix prefix hit does not need the DSA swap coordinator that keeps other
+    # HiSparse models on the plain batch path. Opt-in until it has been
+    # validated for a given deployment.
+    from sglang.srt.environ import envs
+
+    qsa_radix_allowed = is_qsa_hisparse and envs.SGLANG_QSA_HISPARSE_RADIX.get()
+    if qsa_radix_allowed:
+        logger.warning(
+            "SGLANG_QSA_HISPARSE_RADIX=1: running Qwen4-Exp QSA HiSparse with the "
+            "radix prefix cache enabled (experimental)."
+        )
+    else:
+        assert cfg.disable_radix_cache, (
+            "Hierarchical sparse attention currently requires --disable-radix-cache."
+        )
     validate_hisparse_feature_combos(server_args)
 
     enable_spec = (
