@@ -1310,6 +1310,11 @@ class Envs:
     # assertion protects. Off by default because the hybrid SSM radix
     # components have never been exercised on this pool.
     SGLANG_QSA_HISPARSE_RADIX = EnvBool(False)
+    # Run the HiCache host pool for HiSparse Qwen4-Exp QSA. The QSA pool keeps
+    # the full-attention K/V on a pinned mirror addressed by logical slot id
+    # (its device tier only covers the resident window), so the host pool copies
+    # host-to-host; off until that path is validated.
+    SGLANG_QSA_HISPARSE_HICACHE = EnvBool(False)
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)

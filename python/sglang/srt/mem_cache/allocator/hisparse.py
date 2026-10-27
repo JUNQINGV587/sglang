@@ -129,6 +129,16 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc(self, need_size: int):
         if self.page_size != 1:
+            if self.host_tier_only:
+                # With the host tier owning every K/V row there are no device
+                # pages to hand out: the allocation is the logical slot run,
+                # which is also what HiCache's load-back needs (it loads into
+                # the host tier, not into the resident window).
+                assert need_size % self.page_size == 0, (
+                    "HiSparse host-tier allocation is page granular; got "
+                    f"need_size={need_size}, page_size={self.page_size}."
+                )
+                return self.logical_attn_allocator.alloc(need_size)
             raise NotImplementedError(
                 "HiSparse generic allocation is only supported for page_size=1. "
                 "Use alloc_extend for paged allocation."

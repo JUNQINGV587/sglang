@@ -445,6 +445,14 @@ class HiSparseQSATokenToKVPool(QSATokenToKVPool):
             torch.zeros((rows, kv_heads, head_dim), **host_kwargs)
             for _ in self.full_attention_layer_id_mapping
         ]
+        # HiCache builds its KV host pool over ``full_kv_pool`` (the paged MHA
+        # device tier), whose rows only cover ``size`` device slots.  The K/V
+        # rows themselves live on the mirror above, addressed by logical slot
+        # id, so hand the inner pool a back reference: the host pool builder
+        # uses it to pick the host-to-host QSA adapter and to size itself over
+        # the logical space instead of the device window.
+        full.qsa_mirror_owner = self
+        full.is_hisparse_qsa = True
 
     # ---- address translation -------------------------------------------------
     def _translate_loc_to_hisparse_device(self, loc: torch.Tensor) -> torch.Tensor:

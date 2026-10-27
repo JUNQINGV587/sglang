@@ -177,6 +177,33 @@ def build_kv_host_pool(
         kv_host_pool_cls, host_input, mha_kwargs = _mha_host_inputs(
             kv_pool, mtp_draft_device_pools
         )
+        # HiCache is handed the inner paged MHA pool of a HiSparse QSA cache, so
+        # look for the wrapper that owns the pinned K/V mirror as well.
+        qsa_mirror_owner = getattr(kv_pool, "qsa_mirror_owner", None)
+        if getattr(kv_pool, "is_hisparse_qsa", False) or qsa_mirror_owner is not None:
+            # HiSparse QSA keeps the K/V on a pinned mirror addressed by logical
+            # slot id and the device tier only holds the resident window, so a
+            # device<->host pool would index rows that do not exist. The QSA
+            # pool therefore transfers host-to-host (see
+            # ``HiSparseQSAFullKVPoolHost``) and is sized over the logical slot
+            # space, which is what its mirror rows are.
+            from sglang.srt.environ import envs
+            from sglang.srt.mem_cache.pool_host.qsa import (
+                HiSparseQSAFullKVPoolHost,
+            )
+
+            if not envs.SGLANG_QSA_HISPARSE_HICACHE.get():
+                raise NotImplementedError(
+                    "HiCache with --enable-hisparse on Qwen4-Exp QSA indexes the "
+                    "pinned QSA mirror by logical slot id; the stock device<->host "
+                    "path would use those ids as device rows (the device tier only "
+                    "holds the resident window). Set SGLANG_QSA_HISPARSE_HICACHE=1 "
+                    "to run the host-to-host QSA host pool instead."
+                )
+            qsa_pool = qsa_mirror_owner if qsa_mirror_owner is not None else kv_pool
+            kv_host_pool_cls = HiSparseQSAFullKVPoolHost
+            mha_kwargs["qsa_pool"] = qsa_pool
+            mha_kwargs["device_capacity_tokens"] = qsa_pool._logical_size
     if use_mla and override_kv_cache_dim is None:
         # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim. The
         # device pool already resolved the row width.
