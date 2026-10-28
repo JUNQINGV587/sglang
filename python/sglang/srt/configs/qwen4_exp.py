@@ -16,6 +16,9 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
     model_type = "qwen4_exp_text"
     base_config_key = "text_config"
     keys_to_ignore_at_inference = ["past_key_values"]
+    # Qwen4 stores model-specific M-RoPE fields in the standard rope_parameters
+    # dict; Transformers' generic validator must not flag them as unknown.
+    ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
     # ModelConfig sizes the speculative hidden width off the DSV4 mHC name.
     attribute_map = {"hc_mult": "hc_count"}
 
@@ -116,6 +119,9 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
 
 class Qwen4ExpConfig(PretrainedConfig):
     model_type = "qwen4_exp"
+    # Older exports copied the text M-RoPE fields to the top level; keep them
+    # for compatibility but exclude them from Transformers' generic validation.
+    ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
     sub_configs = {
         "vision_config": Qwen4ExpVisionConfig,
         "text_config": Qwen4ExpTextConfig,
